@@ -1,6 +1,11 @@
-name: RC11 GAS deploy (manual first)
+name: RC11 GAS deploy (auto on source update)
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'Code.gs'
+      - 'appsscript.json'
   workflow_dispatch:
 
 permissions:
