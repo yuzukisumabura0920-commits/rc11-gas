@@ -7,6 +7,12 @@ on:
       - 'Code.gs'
       - 'appsscript.json'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: 'Exact public repository commit to deploy after sync'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +27,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
