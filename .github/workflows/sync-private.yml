@@ -1,4 +1,5 @@
 name: RC11 sync private source into public GAS
+# Read-only private source credential verification; runtime code unchanged.
 
 on:
   workflow_dispatch:
