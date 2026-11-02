@@ -6770,7 +6770,6 @@ function rc11SheetsInboxAck_(ss,state) {
   return changes;
 }
 
-
 /** RC11 daily operation. Sheets holds the journal, GAS runs it, Todoist displays it.
  * The historical strict preview remains available for old audit reproduction.
  * Entry points below use the owner-requested overdue/late-report semantics. */
@@ -7118,7 +7117,6 @@ function rc11DailyTodoistConnectionCheck(){
  console.log('RC11_TODOIST_CHECK '+JSON.stringify(result));
  return result;
 }
-
 
 /**
  * Step 3: rebuild review state from migrated grading evidence.
