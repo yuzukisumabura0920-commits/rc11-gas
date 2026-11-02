@@ -1,0 +1,11 @@
+import {readFile} from 'node:fs/promises';
+import vm from 'node:vm';
+const code=await readFile('Code.gs','utf8');
+const manifest=JSON.parse(await readFile('appsscript.json','utf8'));
+if(code.length<100000 || code.length>1000000)throw Error('GAS_SOURCE_SIZE_UNEXPECTED');
+const required=['function rc11DailyRun(', 'function rc11DailyRepairHistory(', 'function rc11DailyImportLegacy(', 'function rc11DailyTodoistSend_(', 'function rc11NextClockFiveMinutes('];
+for(const marker of required)if(!code.includes(marker))throw Error('RC11_ENTRY_MISSING:'+marker);
+if(manifest.runtimeVersion!=='V8'||manifest.timeZone!=='Asia/Tokyo'||!manifest.oauthScopes?.includes('https://www.googleapis.com/auth/spreadsheets'))throw Error('GAS_MANIFEST_MISMATCH');
+if(/AIza[A-Za-z0-9_-]{30,}|gh[pousr]_[A-Za-z0-9_]{16,}|xox[baprs]-[A-Za-z0-9-]{16,}/.test(code))throw Error('POTENTIAL_CREDENTIAL_IN_SOURCE');
+new vm.Script(code,{filename:'Code.gs'});
+console.log(JSON.stringify({status:'GAS_SOURCE_VALID',sourceFiles:['Code.gs','appsscript.json'],functions:required.length}));
