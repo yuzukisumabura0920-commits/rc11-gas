@@ -1,0 +1,26 @@
+name: RC11 public source check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Code.gs'
+      - 'appsscript.json'
+      - 'scripts/check-source.mjs'
+      - '.github/workflows/source-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check RC11 GAS source
+        run: node scripts/check-source.mjs
