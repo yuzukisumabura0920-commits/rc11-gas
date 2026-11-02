@@ -2,6 +2,11 @@ name: RC11 sync private source into public GAS
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sync-private.yml'
+      - 'scripts/import-private-export.mjs'
   schedule:
     - cron: '17,47 * * * *'
 
