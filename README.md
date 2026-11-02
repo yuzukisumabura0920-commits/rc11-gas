@@ -1,19 +1,42 @@
-# RC11 GAS public deployment
+# RC11 GAS — public deployment bridge
 
-This repository contains the **generated Apps Script source snapshot** of RC11, for deploying to the *existing* Apps Script project with free public GitHub Actions and [clasp](https://github.com/google/clasp).
+This repository contains **only the generated Apps Script runtime** of RC11, plus validation and deployment automation. The original **private** source repository remains `rc11-next`; learning data and Todoist credentials remain in private services.
 
-The original `rc11-next` project, its history and the Google Sheets/Todoist data remain private. This repository was initialized with a fresh Git history. **Never commit access tokens, Google OAuth credentials, study results, `.clasp.json`, or `.clasprc.json`.**
+## Deployment status
 
-## Current status
-- GAS source: exported from private `rc11-next` commit `5a021612388f821a039de8e1fa8cd4707f97c772` (history reconciliation included).
-- Automatic deployment: **not activated**. An authenticated first deployment and read-back verification are still required.
-- Secrets: configure `RC11_GAS_SCRIPT_ID` (existing script ID) and `CLASPRC_JSON` (Google clasp OAuth config) in this repository's **Actions secrets**. Do not paste them in chat.
-- All code updates must originate from the private source repository and be checked for embedded credentials/personal history before publishing.
+- Public repository → GitHub Actions → clasp → existing GAS: first manual push and remote source read-back **passed** (run [41481014420](https://github.com/yuzukisumabura0920-commits/rc11-gas/actions/runs/41481014420)).
+- Public `Code.gs` or `appsscript.json` changes on `main`: **automatically deploy** through [deploy.yml](.github/workflows/deploy.yml); workflow dispatch remains available.
+- Private `rc11-next/main` → public GAS: [sync-private.yml](.github/workflows/sync-private.yml) checks every ~30 minutes and rebuilds source on a free public runner. **Not activated until the read-only private repository secret is configured.**
+- This is a source deployment, not an execution of the RC11 study-history repair function; review/Todoist operational state must be checked separately.
 
-## Deploy
-Use Actions → `RC11 GAS deploy (manual first)` → Run workflow after secrets are configured.
-The workflow verifies required RC11 functions, pushes `Code.gs` and `appsscript.json` with clasp, and then reads them back for comparison.
+## One-time private source authorization
 
-**Important:** `clasp push` replaces the target Apps Script project's source files. Existing script properties and spreadsheet data are not included in the source bundle, but make sure the correct Script ID is used.
+Create a **fine-grained GitHub personal access token** for only `yuzukisumabura0920-commits/rc11-next` with **Repository permissions → Contents: Read-only**. Other repository permissions do not need Write. Save it as the public repository Actions secret `RC11_PRIVATE_READ_TOKEN`.
 
-Once the first manual run succeeds and live code matches, push-triggered automatic deployment can be enabled in a separate workflow change.
+This token is used by `sync-private.yml` to check out the private repo into a temporary runner workspace, build the latest `Code.gs`, run validation and publish only `Code.gs` and `appsscript.json`. The private source tree, study history, legacy data, test fixtures and tokens are **never committed** to the public repo.
+
+After a new validated public source commit, the same workflow directly calls the clasp deployment workflow against that exact public commit. GitHub's built-in `GITHUB_TOKEN` does not retrigger `push` workflows, so this explicit call is necessary.
+
+## Existing GAS authorization
+
+The public repository's **Actions secrets** are:
+- `RC11_GAS_SCRIPT_ID`: ID of the existing Apps Script project.
+- `CLASPRC_JSON`: Google OAuth credentials for clasp, private to GitHub Actions.
+- `RC11_PRIVATE_READ_TOKEN`: read-only access to the old source repo (still pending).
+
+**Never commit or paste any of these values into source, issues, actions logs or chats.**
+
+## Safety constraints
+
+- Only commit `Code.gs` and `appsscript.json` from the private build. The sync importer enforces size, syntax, required functions and checks for recognizable credentials, email addresses and spreadsheet IDs.
+- The validator is defense in depth, not proof that every possible private datum is absent. Only put approved source changes on private `main`.
+- The release uses standard `ubuntu-latest` on a **public repository**, not paid larger runners.
+- `clasp push --force` replaces the code files in the target project. Spreadsheet data and script properties are separate, but live code always must be validated.
+- Source-sync schedules can be delayed by GitHub. The schedule is near 17 and 47 minutes past the hour, not an instant web hook.
+- For emergencies, disable the `RC11 GAS deploy` and `RC11 sync private source` workflows in Actions to stop deployments.
+
+## Manual checks
+
+- [Public source validation](.github/workflows/source-check.yml)
+- [Private source sync](.github/workflows/sync-private.yml)
+- [GAS deployment](.github/workflows/deploy.yml)
