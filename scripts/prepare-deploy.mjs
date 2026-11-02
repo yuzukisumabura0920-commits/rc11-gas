@@ -1,0 +1,21 @@
+import {readFile,writeFile,mkdir,copyFile,chmod} from 'node:fs/promises';
+import {join} from 'node:path';
+import {homedir} from 'node:os';
+const scriptId=process.env.RC11_GAS_SCRIPT_ID||'';
+const creds=process.env.CLASPRC_JSON||'';
+if(!scriptId||!creds)throw Error('SET_REPOSITORY_SECRETS_RC11_GAS_SCRIPT_ID_AND_CLASPRC_JSON');
+if(!/^[A-Za-z0-9_-]{20,160}$/.test(scriptId))throw Error('INVALID_TARGET_SCRIPT_ID');
+let obj;
+try{obj=JSON.parse(creds)}catch{throw Error('CLASP_CREDENTIAL_JSON_INVALID')}
+if(!obj || typeof obj!=='object'||Array.isArray(obj))throw Error('CLASP_CREDENTIAL_JSON_INVALID');
+await readFile('Code.gs','utf8');
+await readFile('appsscript.json','utf8');
+const authFile=join(homedir(),'.clasprc.json');
+await writeFile(authFile,creds,{mode:0o600});
+await chmod(authFile,0o600);
+await mkdir('clasp-build',{recursive:true});
+await copyFile('Code.gs','clasp-build/Code.gs');
+await copyFile('appsscript.json','clasp-build/appsscript.json');
+await writeFile('.clasp.json',JSON.stringify({scriptId,rootDir:'clasp-build'})+'\n',{mode:0o600});
+await chmod('.clasp.json',0o600);
+console.log('GAS_SOURCE_AND_CLASP_READY');
