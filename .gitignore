@@ -1,0 +1,11 @@
+.clasp.json
+.clasprc.json
+clasp-build/
+node_modules/
+.env
+.env.*
+*.log
+*.token
+*.csv
+*.tsv
+.DS_Store
