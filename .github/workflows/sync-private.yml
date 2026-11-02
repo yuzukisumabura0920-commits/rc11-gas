@@ -1,0 +1,77 @@
+name: RC11 sync private source into public GAS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17,47 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rc11-private-to-public-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.publish.outputs.changed }}
+      published_sha: ${{ steps.publish.outputs.published_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Retrieve only generated private GAS snapshot (read-only)
+        id: source
+        env:
+          RC11_PRIVATE_READ_TOKEN: ${{ secrets.RC11_PRIVATE_READ_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$RC11_PRIVATE_READ_TOKEN" ]; then
+            echo 'Private repository token not yet configured; skipping sync.'
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl --fail --silent --show-error --retry 2 --location \
+            --header "Authorization: Bearer $RC11_PRIVATE_READ_TOKEN" \
+            --header "Accept: application/vnd.github.raw+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            'https://api.github.com/repos/yuzukisumabura0920-commits/rc11-next/contents/exports/RC11_NEXT_GAS_ALL_SOURCE.txt?ref=main' \
+            --output "$RUNNER_TEMP/rc11-private-export.txt"
+          test -s "$RUNNER_TEMP/rc11-private-export.txt"
+      - name: Validate and stage public GAS source
+        if: steps.source.outputs.skip != 'true'
+        env:
+          EXPORT_PATH: ${{ runner.temp }}/rc11-private-export.txt
+        run: |
+          node scripts/import-private-export.mjs "$EXPORT_PATH"
+          node scripts/check-source.mjs
+      - name: Commit public source only when changed
+        if: steps.source.outputs.skip != 'true'
+        id: publish
+        shell: bash
+        run: |
+          git add -- Code.gs appsscript.json
+          if git diff --cached --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'Private GAS snapshot already matches public source.'
+          else
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'Sync validated RC11 GAS source from private main'
+            git push origin HEAD:main
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+            echo "published_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      source_sha: ${{ needs.sync.outputs.published_sha }}
+    secrets: inherit
