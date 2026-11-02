@@ -1,0 +1,38 @@
+name: RC11 GAS deploy (manual first)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rc11-gas-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate public GAS source
+        run: node scripts/check-source.mjs
+      - name: Prepare target and Google credentials from repository Secrets
+        env:
+          RC11_GAS_SCRIPT_ID: ${{ secrets.RC11_GAS_SCRIPT_ID }}
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: node scripts/prepare-deploy.mjs
+      - name: Push source to existing GAS project
+        run: npx --yes --package=@google/clasp@3.4.1 clasp push --force
+      - name: Read back deployed GAS files
+        run: |
+          mkdir -p /tmp/rc11-gas-readback
+          cp .clasp.json /tmp/rc11-gas-readback/.clasp.json
+          cd /tmp/rc11-gas-readback
+          npx --yes --package=@google/clasp@3.4.1 clasp pull
+          cd "$GITHUB_WORKSPACE"
+          node scripts/verify-readback.mjs /tmp/rc11-gas-readback/clasp-build
