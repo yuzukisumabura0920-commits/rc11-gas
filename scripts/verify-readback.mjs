@@ -1,0 +1,14 @@
+import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {createHash} from 'node:crypto';
+const folder=process.argv[2];
+if(!folder)throw Error('USAGE: verify-readback.mjs <pulled-files-dir>');
+const read=async (...files)=>{for(const name of files){try{return await readFile(name,'utf8')}catch(e){if(e.code!=='ENOENT')throw e}}throw Error('READBACK_SOURCE_NOT_FOUND')};
+const expected=await readFile('Code.gs','utf8');
+const actual=await read(join(folder,'Code.gs'),join(folder,'Code.js'));
+const norm=x=>x.replace(/\r\n/g,'\n').trimEnd()+'\n';
+if(norm(expected)!==norm(actual))throw Error('REMOTE_GAS_CODE_MISMATCH');
+const local=JSON.parse(await readFile('appsscript.json','utf8'));
+const remote=JSON.parse(await read(join(folder,'appsscript.json')));
+if(local.runtimeVersion!==remote.runtimeVersion||local.timeZone!==remote.timeZone||(local.oauthScopes||[]).slice().sort().join('|')!==(remote.oauthScopes||[]).slice().sort().join('|'))throw Error('REMOTE_GAS_MANIFEST_MISMATCH');
+console.log(JSON.stringify({status:'GAS_CODE_REFLECTED',sha256:createHash('sha256').update(norm(actual)).digest('hex'),sourceCommit:process.env.GITHUB_SHA||null}));
