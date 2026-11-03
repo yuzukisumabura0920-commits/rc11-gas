@@ -6873,7 +6873,12 @@ function rc11DailyApply_(state,request,today){
   }else if(op.type==='CORRECT_REPORT'||op.type==='RETRACT_REPORT'){
    if(!s.reports.some(r=>r.submissionId===op.target))throw Error('REPORT_NOT_FOUND');
    if(op.type==='CORRECT_REPORT'&&!['○','△','×'].includes(op.grade))throw Error('INVALID_GRADE');
-   s.corrections.push({id:request.id+':'+s.corrections.length,target:op.target,grade:op.grade,retract:op.type==='RETRACT_REPORT',...(op.studyDay?{studyDay:op.studyDay}:{})});
+   const correction={id:request.id+':'+s.corrections.length,target:op.target,grade:op.grade,retract:op.type==='RETRACT_REPORT',...(op.studyDay?{studyDay:op.studyDay}:{})};
+   const candidate={...s,corrections:s.corrections.concat(correction)},target=s.reports.find(r=>r.submissionId===op.target).problem;
+   const reports=rc11DailyReports_(candidate).filter(r=>rc11DailyKey_(r.problem)===rc11DailyKey_(target));
+   const checked=rc11DailyReview_(candidate,target,reports,today);
+   if(!['ready','NEW'].includes(checked.status))throw Error('CORRECTION_'+checked.reasons.join(','));
+   s.corrections.push(correction);
   }else if(op.type==='SET_CAPACITY'){
    const day=op.day;if(!day?.date)throw Error('DAY_REQUIRED');const n=s.catalog.days.findIndex(x=>x.date===day.date);if(n<0)s.catalog.days.push(day);else s.catalog.days[n]=day;
   }else if(op.type==='SET_WEEKLY'){s.catalog.weekly=op.weekly;
@@ -6919,7 +6924,9 @@ function rc11DailyDiff_(s){
   if(b.members.some(id=>outstanding.has(id))){const task={...b.task,due:null,content:'未配置｜'+b.task.content.replace(/^未配置｜/, '')};if(JSON.stringify(task)!==JSON.stringify(b.task))ops.push({kind:'UPDATE',bindingId:b.id,remoteId:b.remoteId,members:b.members,task});}
   else ops.push({kind:'CLOSE',bindingId:b.id,remoteId:b.remoteId,members:b.members});
  }
- return ops;
+ // Free obsolete display slots before adding replacements to a full project.
+ // Only our already-bound tasks can appear in CLOSE operations.
+ return ops.filter(op=>op.kind==='CLOSE').concat(ops.filter(op=>op.kind!=='CLOSE'));
 }
 function rc11DailyCommand_(config,op){return rc11DailyTodoistSend_(UrlFetchApp,config,op);}
 function rc11DailyApplyAck_(s,op,remoteId){
@@ -6934,7 +6941,16 @@ function rc11DailySync_(opened,s,head){
   if(!op){op=rc11DailyDiff_(s)[0];if(!op)return {head,status:'SYNCED',processed:count};
    op.uuid=rc11TodoistCommandId_(rc11DailyHash_([s.revision,op]));s.pending=op;head=rc11DailySave_(store,s,head,{type:'SYNC_INTENT',op});}
   // Reuse the stored Sync API UUID after an interrupted request, never invent a new CREATE.
-  let remoteId;try{remoteId=rc11DailyCommand_(config,op);}catch(e){return {head,status:'SYNC_PENDING',processed:count,reason:String(e.message||e)};}
+  let remoteId;try{remoteId=rc11DailyCommand_(config,op);}catch(e){
+   if(op.kind==='CREATE'&&e.todoistQuotaRejected===true){
+    // A provider-confirmed rejection created nothing. Retire this UUID so the
+    // next tick can process reports/replan instead of retrying a blocked intent.
+    // Ambiguous network failures still retain the exact pending UUID below.
+    s.pending=null;head=rc11DailySave_(store,s,head,{type:'SYNC_REJECTED',uuid:op.uuid,reason:'MAX_ITEMS_LIMIT_REACHED'});
+    if(rc11DailyDiff_(s).some(x=>x.kind==='CLOSE'))continue;
+   }
+   return {head,status:'SYNC_PENDING',processed:count,reason:String(e.message||e)};
+  }
   rc11DailyApplyAck_(s,op,remoteId);head=rc11DailySave_(store,s,head,{type:'SYNC_ACK',uuid:op.uuid,remoteId});count++;
  }
  return {head,status:'SYNC_PARTIAL',processed:count};
@@ -7069,7 +7085,11 @@ function rc11DailyTodoistSend_(fetcher,config,op){
  });
  if(response.getResponseCode()!==200)throw Error('TODOIST_HTTP_'+response.getResponseCode());
  const data=JSON.parse(response.getContentText()),result=data?.sync_status?.[cmd.uuid];
- if(result!=='ok')throw Error('TODOIST_COMMAND_'+JSON.stringify(result||'MISSING'));
+ if(result!=='ok'){
+  const error=Error('TODOIST_COMMAND_'+JSON.stringify(result||'MISSING'));
+  error.todoistQuotaRejected=result?.error_code===49&&result?.error_tag==='MAX_ITEMS_LIMIT_REACHED';
+  throw error;
+ }
  const id=op.kind==='CREATE'?data.temp_id_mapping?.[cmd.uuid]:op.remoteId;
  if(typeof id!=='string'||!id.length)throw Error('TODOIST_REMOTE_ID_MISSING');
  return id;
