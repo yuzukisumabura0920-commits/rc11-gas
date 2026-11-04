@@ -6942,6 +6942,21 @@ function rc11DailySync_(opened,s,head){
    op.uuid=rc11TodoistCommandId_(rc11DailyHash_([s.revision,op]));s.pending=op;head=rc11DailySave_(store,s,head,{type:'SYNC_INTENT',op});}
   // Reuse the stored Sync API UUID after an interrupted request, never invent a new CREATE.
   let remoteId;try{remoteId=rc11DailyCommand_(config,op);}catch(e){
+   // A provider-confirmed missing remote task is not an ambiguous network failure.
+   // Retire only its display binding, never its study history or review state.
+   // The normal diff will then recreate the task from the canonical plan.
+   const msg=String(e.message||e);
+   const missingRemote=/\b404\b|ITEM_NOT_FOUND|TASK_NOT_FOUND|item_not_found|task_not_found/i.test(msg);
+   if((op.kind==='UPDATE'||op.kind==='CLOSE')&&missingRemote){
+    const binding=s.bindings.find(b=>b.id===op.bindingId);
+    if(binding&&binding.remoteId===op.remoteId){
+     binding.closed=true;
+     s.pending=null;
+     head=rc11DailySave_(store,s,head,{type:'SYNC_STALE_BINDING_RETIRED',bindingId:op.bindingId,remoteId:op.remoteId,reason:'REMOTE_NOT_FOUND'});
+     count++;
+     continue;
+    }
+   }
    if(op.kind==='CREATE'&&e.todoistQuotaRejected===true){
     // A provider-confirmed rejection created nothing. Retire this UUID so the
     // next tick can process reports/replan instead of retrying a blocked intent.
