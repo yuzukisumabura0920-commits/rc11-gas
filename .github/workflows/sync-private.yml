@@ -1,5 +1,5 @@
 name: RC11 sync private source into public GAS
-# Read-only private source credential verification; runtime code unchanged.
+# Canonical private-main sync; safe manual kick after RC11 PR92 merge (no new behavior).
 
 on:
   workflow_dispatch:
