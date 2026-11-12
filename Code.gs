@@ -213,6 +213,7 @@ const Obligation = zod_1.z.object({ occurrenceId: schema_js_1.IdSchema, problem:
 exports.WorkSchema = zod_1.z.object({ problem: schema_js_1.ProblemRefSchema, policyRevision: schema_js_1.IdSchema, approvalRef: schema_js_1.IdSchema,
     priority: zod_1.z.number().int().min(1).max(4), rank: zod_1.z.number().optional(), minutes: zod_1.z.number().int().positive().max(1440).nullable(),
     firstAttemptBy: schema_js_1.DateSchema.nullable(), masteryBy: schema_js_1.DateSchema.nullable(), earliestDate: schema_js_1.DateSchema.optional(),
+    subject: zod_1.z.string().optional(), category: zod_1.z.enum(['exercise', 'pastpaper', 'routine']).optional(), preferredDate: schema_js_1.DateSchema.optional(), focusFrom: schema_js_1.DateSchema.optional(), focusThrough: schema_js_1.DateSchema.optional(),
     state: zod_1.z.discriminatedUnion('status', [
         zod_1.z.object({ status: zod_1.z.literal('NEW') }).strict(),
         zod_1.z.object({ status: zod_1.z.literal('HOLD'), reasons: zod_1.z.array(schema_js_1.IdSchema).min(1), knownObligations: zod_1.z.array(Obligation).max(2) }).strict(),
@@ -224,6 +225,8 @@ exports.PlanningDaySchema = zod_1.z.object({ date: schema_js_1.DateSchema, class
 const Previous = zod_1.z.object({ occurrenceId: schema_js_1.IdSchema, scheduledDate: schema_js_1.DateSchema }).strict();
 exports.PlanInputSchema = zod_1.z.object({ asOf: schema_js_1.InstantSchema, baseGeneration: zod_1.z.number().int().nonnegative(),
     policyRevision: schema_js_1.IdSchema, newMode: zod_1.z.enum(['enabled', 'disabled', 'hold']), days: zod_1.z.array(exports.PlanningDaySchema).max(366),
+    focus: zod_1.z.array(zod_1.z.object({ from: schema_js_1.DateSchema, through: schema_js_1.DateSchema, materials: zod_1.z.array(schema_js_1.IdSchema) }).strict()).optional(),
+    pastPapersPerWeek: zod_1.z.number().int().min(0).max(14).optional(),
     work: zod_1.z.array(exports.WorkSchema).max(5000), previous: zod_1.z.array(Previous).max(10000),
     grouping: zod_1.z.object({ targetMinutes: zod_1.z.literal(60), implementationMaxMinutes: zod_1.z.literal(80) }).strict()
 }).strict();
@@ -306,47 +309,51 @@ function simulatePlan(raw, daily = false) {
     }
     const ranks = new Map(input.work.map(w => [(0, schema_js_1.problemKey)(w.problem), w.rank ?? w.priority]));
     plan.occurrences.sort((a, b) => compare(deadline(a) ?? '9999-12-31', deadline(b) ?? '9999-12-31') || compare(a.idealReviewDate ?? today.value, b.idealReviewDate ?? today.value) || (daily ? (ranks.get((0, schema_js_1.problemKey)(b.problem)) ?? b.priority) - (ranks.get((0, schema_js_1.problemKey)(a.problem)) ?? a.priority) : 0) || compare(a.occurrenceId, b.occurrenceId));
-    for (const o of plan.occurrences) {
-        if (o.status === 'HOLD')
-            continue;
-        const minutes = o.minutes;
-        let earliest = o.idealReviewDate && o.idealReviewDate > today.value ? o.idealReviewDate : today.value;
-        if (daily) {
-            const w = input.work.find(w => (0, schema_js_1.problemKey)(w.problem) === (0, schema_js_1.problemKey)(o.problem));
-            if (w?.earliestDate && w.earliestDate > earliest)
-                earliest = w.earliestDate;
-        }
-        if (daily && o.stage === 'R2') {
-            const r1 = plan.occurrences.find(x => x.stage === 'R1' && (0, schema_js_1.problemKey)(x.problem) === (0, schema_js_1.problemKey)(o.problem));
-            if (r1) {
-                if (r1.status !== 'SCHEDULED') {
-                    o.reasons.push('WAITING_FOR_R1_PLACEMENT');
-                    continue;
-                }
-                const next = new Date(r1.scheduledDate + 'T00:00:00Z');
-                next.setUTCDate(next.getUTCDate() + 1);
-                earliest = [earliest, next.toISOString().slice(0, 10)].sort().pop();
+    if (daily)
+        allocateDaily(plan, input, today.value);
+    else {
+        for (const o of plan.occurrences) {
+            if (o.status === 'HOLD')
+                continue;
+            const minutes = o.minutes;
+            let earliest = o.idealReviewDate && o.idealReviewDate > today.value ? o.idealReviewDate : today.value;
+            if (daily) {
+                const w = input.work.find(w => (0, schema_js_1.problemKey)(w.problem) === (0, schema_js_1.problemKey)(o.problem));
+                if (w?.earliestDate && w.earliestDate > earliest)
+                    earliest = w.earliestDate;
             }
+            if (daily && o.stage === 'R2') {
+                const r1 = plan.occurrences.find(x => x.stage === 'R1' && (0, schema_js_1.problemKey)(x.problem) === (0, schema_js_1.problemKey)(o.problem));
+                if (r1) {
+                    if (r1.status !== 'SCHEDULED') {
+                        o.reasons.push('WAITING_FOR_R1_PLACEMENT');
+                        continue;
+                    }
+                    const next = new Date(r1.scheduledDate + 'T00:00:00Z');
+                    next.setUTCDate(next.getUTCDate() + 1);
+                    earliest = [earliest, next.toISOString().slice(0, 10)].sort().pop();
+                }
+            }
+            const day = plan.days.find(d => d.date >= earliest && d.availableMinutes - d.usedMinutes >= minutes);
+            if (!day) {
+                o.reasons.push(plan.days.every(d => d.date < earliest) ? 'OUTSIDE_HORIZON' : 'CAPACITY_SHORTAGE');
+                plan.risks.push({ occurrenceId: o.occurrenceId, code: o.reasons[0], missingMinutes: minutes });
+                continue;
+            }
+            o.status = 'SCHEDULED';
+            o.scheduledDate = day.date;
+            day.usedMinutes += minutes;
+            const prior = input.previous.find(p => p.occurrenceId === o.occurrenceId);
+            if (prior && prior.scheduledDate < today.value)
+                o.reasons.push('UNREPORTED_REPROPOSAL');
+            else
+                o.reasons.push(prior?.scheduledDate === day.date ? 'PLACEMENT_RETAINED' : prior ? 'CAPACITY_REPLAN' : 'EARLIEST_CAPACITY');
+            const due = deadline(o);
+            if (due && day.date > due)
+                plan.risks.push({ occurrenceId: o.occurrenceId, code: o.stage === 'NEW' ? 'FIRST_ATTEMPT_DEADLINE_EXCEEDED' : 'MASTERY_DEADLINE_EXCEEDED', missingMinutes: minutes });
+            if (o.masteryBy && (day.date > o.masteryBy || o.stage !== 'NEW'))
+                plan.risks.push({ occurrenceId: o.occurrenceId, code: 'GRADUATION_NOT_GUARANTEED', missingMinutes: 0 });
         }
-        const day = plan.days.find(d => d.date >= earliest && d.availableMinutes - d.usedMinutes >= minutes);
-        if (!day) {
-            o.reasons.push(plan.days.every(d => d.date < earliest) ? 'OUTSIDE_HORIZON' : 'CAPACITY_SHORTAGE');
-            plan.risks.push({ occurrenceId: o.occurrenceId, code: o.reasons[0], missingMinutes: minutes });
-            continue;
-        }
-        o.status = 'SCHEDULED';
-        o.scheduledDate = day.date;
-        day.usedMinutes += minutes;
-        const prior = input.previous.find(p => p.occurrenceId === o.occurrenceId);
-        if (prior && prior.scheduledDate < today.value)
-            o.reasons.push('UNREPORTED_REPROPOSAL');
-        else
-            o.reasons.push(prior?.scheduledDate === day.date ? 'PLACEMENT_RETAINED' : prior ? 'CAPACITY_REPLAN' : 'EARLIEST_CAPACITY');
-        const due = deadline(o);
-        if (due && day.date > due)
-            plan.risks.push({ occurrenceId: o.occurrenceId, code: o.stage === 'NEW' ? 'FIRST_ATTEMPT_DEADLINE_EXCEEDED' : 'MASTERY_DEADLINE_EXCEEDED', missingMinutes: minutes });
-        if (o.masteryBy && (day.date > o.masteryBy || o.stage !== 'NEW'))
-            plan.risks.push({ occurrenceId: o.occurrenceId, code: 'GRADUATION_NOT_GUARANTEED', missingMinutes: 0 });
     }
     // Chunk only compatible constraints; an 80-minute grouping implementation threshold is not policy.
     const bins = new Map();
@@ -363,6 +370,106 @@ function simulatePlan(raw, daily = false) {
     plan.revisionId = (0, canonical_js_1.canonical)(['PLAN', input.baseGeneration, input.asOf, plan.occurrences, plan.groups, plan.days]);
     // IDs/revisions contain private domain references. They are not public log messages.
     return plan;
+}
+/** Rebuild the complete horizon. Daily knapsack uses urgency, weekly paper cadence,
+ * subject load and previous placements, instead of letting the first sorted item
+ * claim every early day. Integer-minute packing keeps unused fragments small. */
+function allocateDaily(plan, input, today) {
+    const metadata = new Map(input.work.map(w => [(0, schema_js_1.problemKey)(w.problem), w]));
+    const prior = new Map(input.previous.map(p => [p.occurrenceId, p.scheduledDate]));
+    const kind = (o) => metadata.get((0, schema_js_1.problemKey)(o.problem)).category ??
+        (o.problem.materialId === 'NAGOYA_PASTPAPER' ? 'pastpaper' : o.problem.editionId === 'routine' ? 'routine' : 'exercise');
+    const subject = (o) => metadata.get((0, schema_js_1.problemKey)(o.problem)).subject ??
+        (kind(o) === 'pastpaper' ? o.problem.problemNumber.replace(/^.*年度\s*/, '') : o.problem.materialId.split('_')[0]);
+    const plus = (d, n) => new Date(Date.parse(d + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+    const week = (d) => plus(d, -((new Date(d + 'T00:00:00Z').getUTCDay() + 6) % 7));
+    const target = input.pastPapersPerWeek ?? 6, weekly = new Map(), loads = new Map();
+    const earliest = (o) => {
+        let date = [today, o.idealReviewDate ?? today, metadata.get((0, schema_js_1.problemKey)(o.problem)).earliestDate ?? today].sort().pop();
+        if (o.stage === 'R2') {
+            const r1 = plan.occurrences.find(x => x.stage === 'R1' && (0, schema_js_1.problemKey)(x.problem) === (0, schema_js_1.problemKey)(o.problem));
+            if (r1) {
+                if (!r1.scheduledDate)
+                    return '9999-12-31';
+                date = [date, plus(r1.scheduledDate, 1)].sort().pop();
+            }
+        }
+        return date;
+    };
+    const due = (o) => o.stage === 'NEW' ? o.firstAttemptBy : o.masteryBy;
+    for (const d of plan.days) {
+        const capacity = d.availableMinutes;
+        if (!capacity)
+            continue;
+        const eligible = plan.occurrences.filter(o => o.status === 'UNPLACED' && o.minutes !== null && o.minutes <= capacity && earliest(o) <= d.date);
+        if (!eligible.length)
+            continue;
+        const wk = week(d.date), papers = weekly.get(wk) || 0;
+        const focus = input.focus?.find(f => f.from <= d.date && d.date <= f.through);
+        const score = (o) => {
+            const w = metadata.get((0, schema_js_1.problemKey)(o.problem)), deadline = due(o);
+            const urgent = deadline !== null && deadline <= d.date;
+            const review = o.stage !== 'NEW';
+            const focused = (w.focusFrom && w.focusThrough && w.focusFrom <= d.date && d.date <= w.focusThrough) || focus?.materials.includes(o.problem.materialId);
+            // Utility is per minute: a long exam must not lose to many tiny exercises.
+            return o.minutes * (100 + (review ? 900 : 0) + (urgent ? 700 : 0) + (focused ? 600 : 0) +
+                (kind(o) === 'routine' ? 1500 : 0) + Math.min(100, w.rank ?? w.priority) * 2 +
+                200 / (1 + (loads.get(subject(o)) || 0) / 60) +
+                (prior.get(o.occurrenceId) === d.date || w.preferredDate === d.date ? 5 : 0));
+        };
+        const pack = (items, limit) => {
+            const dp = Array(limit + 1);
+            dp[0] = { score: 0, items: [] };
+            for (const o of items) {
+                const n = o.minutes, v = score(o);
+                for (let m = limit; m >= n; m--) {
+                    const prev = dp[m - n];
+                    if (prev && (!dp[m] || dp[m].score < prev.score + v))
+                        dp[m] = { score: prev.score + v, items: prev.items.concat(o) };
+                }
+            }
+            let best = { score: 0, items: [] };
+            for (const x of dp)
+                if (x && x.score > best.score)
+                    best = x;
+            return best;
+        };
+        const ordinary = eligible.filter(o => kind(o) !== 'pastpaper' || o.stage !== 'NEW');
+        const exams = eligible.filter(o => kind(o) === 'pastpaper' && o.stage === 'NEW');
+        let best = pack(ordinary, capacity);
+        const remainingDays = plan.days.filter(x => week(x.date) === wk && x.date >= d.date && x.availableMinutes > 0).length;
+        // Reserve a paper on most non-focus study days until the weekly target is met.
+        const activeFocus = !!focus || input.work.some(w => w.focusFrom && w.focusThrough && w.focusFrom <= d.date && d.date <= w.focusThrough);
+        const want = target > papers && !activeFocus;
+        for (const exam of exams) {
+            const result = pack(ordinary, capacity - exam.minutes);
+            const cadence = want ? (remainingDays <= target - papers ? capacity * 1800 : capacity * 800) : 0;
+            const value = result.score + score(exam) + (papers >= target ? -capacity * 1800 : cadence);
+            if (value > best.score)
+                best = { score: value, items: result.items.concat(exam) };
+        }
+        for (const o of best.items) {
+            o.status = 'SCHEDULED';
+            o.scheduledDate = d.date;
+            d.usedMinutes += o.minutes;
+            loads.set(subject(o), (loads.get(subject(o)) || 0) + o.minutes);
+            if (kind(o) === 'pastpaper' && o.stage === 'NEW')
+                weekly.set(wk, (weekly.get(wk) || 0) + 1);
+            const prev = prior.get(o.occurrenceId);
+            o.reasons.push(prev && prev < today ? 'UNREPORTED_REPROPOSAL' : prev === d.date ? 'PLACEMENT_RETAINED' : prev ? 'CAPACITY_REPLAN' : 'BALANCED_CAPACITY');
+            const deadline = due(o);
+            if (deadline && d.date > deadline)
+                plan.risks.push({ occurrenceId: o.occurrenceId, code: o.stage === 'NEW' ? 'FIRST_ATTEMPT_DEADLINE_EXCEEDED' : 'MASTERY_DEADLINE_EXCEEDED', missingMinutes: o.minutes });
+            if (o.masteryBy && (d.date > o.masteryBy || o.stage !== 'NEW'))
+                plan.risks.push({ occurrenceId: o.occurrenceId, code: 'GRADUATION_NOT_GUARANTEED', missingMinutes: 0 });
+        }
+    }
+    for (const o of plan.occurrences.filter(o => o.status === 'UNPLACED')) {
+        const wait = o.stage === 'R2' && plan.occurrences.some(r => r.stage === 'R1' && (0, schema_js_1.problemKey)(r.problem) === (0, schema_js_1.problemKey)(o.problem) && r.status !== 'SCHEDULED');
+        const reason = wait ? 'WAITING_FOR_R1_PLACEMENT' : plan.days.every(d => d.date < earliest(o)) ? 'OUTSIDE_HORIZON' : kind(o) === 'pastpaper' && plan.days.some(d => d.date >= earliest(o) && d.availableMinutes - d.usedMinutes >= o.minutes) ? 'PASTPAPER_CADENCE_OR_BALANCE' : 'CAPACITY_SHORTAGE';
+        o.reasons.push(reason);
+        plan.risks.push({ occurrenceId: o.occurrenceId, code: reason, missingMinutes: o.minutes || 0 });
+    }
 }
 /** Todoist convention: numeric 4 is highest. */
 const simulateDailyPlan = (raw) => simulatePlan(raw, true);
@@ -6790,7 +6897,7 @@ function rc11DailyOpen_(){
  return {config,sheet,store:rc11SheetsDailyStore_(sheet)};
 }
 function rc11DailyLock_(fn){const l=LockService.getScriptLock();if(!l.tryLock(1000))return {status:'BUSY'};try{return fn();}finally{l.releaseLock();}}
-function rc11DailyEmpty_(){return {version:1,revision:0,catalog:{work:[],days:[],weekly:null,newMode:'enabled',horizon:35,routines:[]},reports:[],corrections:[],bindings:[],requests:{},completedRoutines:[],pending:null,plan:null,dirty:true,lastClose:null,imported:[]};}
+function rc11DailyEmpty_(){return {version:1,revision:0,catalog:{work:[],days:[],weekly:null,newMode:'enabled',horizon:35,routines:[]},reports:[],corrections:[],bindings:[],requests:{},completedRoutines:[],completedPastPapers:[],pending:null,plan:null,dirty:true,lastClose:null,imported:[]};}
 function rc11DailyRead_(store){const snap=store.read();for(let i=snap.state.events.length-1;i>=0;i--){const ref=snap.state.events[i];if(ref.id.startsWith('diagnostic:daily:')){const e=store.readEvent(ref),body=JSON.parse(e.raw);if(body.state?.version!==1)throw Error('DAILY_STATE_INVALID');return {state:body.state,head:snap.head};}}return {state:rc11DailyEmpty_(),head:snap.head};}
 function rc11DailySave_(store,state,head,action){
  const next=JSON.parse(JSON.stringify(state));next.revision++;
@@ -6819,12 +6926,13 @@ function rc11DailyDays_(catalog,today){
    fixed:w.fixed||[],calendarEvidenceRef:'daily-weekly',capacityExceptionRef:'daily-weekly'});
  }return days;
 }
-function rc11DailyWork_(w){return {problem:w.problem,policyRevision:'v0.3',approvalRef:w.approvalRef||'daily-owner',priority:w.priority??2,...(w.rank!==undefined?{rank:w.rank}:{}),minutes:w.minutes??20,firstAttemptBy:w.firstAttemptBy||null,masteryBy:w.masteryBy||null,...(w.earliestDate?{earliestDate:w.earliestDate}:{}),state:{status:'NEW'}};}
+function rc11DailyWork_(w){return {problem:w.problem,policyRevision:'v0.3',approvalRef:w.approvalRef||'daily-owner',priority:w.priority??2,...(w.rank!==undefined?{rank:w.rank}:{}),minutes:w.minutes??20,firstAttemptBy:w.firstAttemptBy||null,masteryBy:w.masteryBy||null,...(w.focusFrom?{focusFrom:w.focusFrom,focusThrough:w.focusThrough}:{}),...(w.subject?{subject:w.subject}:{}),...(w.category?{category:w.category}:{}),...(w.preferredDate?{preferredDate:w.preferredDate}:{}),...(w.earliestDate?{earliestDate:w.earliestDate}:{}),state:{status:'NEW'}};}
 function rc11DailyPlan_(s,today,instant){
  const reports=rc11DailyReports_(s),by=new Map();
  for(const r of reports){const k=rc11DailyKey_(r.problem);by.set(k,(by.get(k)||[]).concat(r));}
  const work=[],held=[];
  for(const entry of s.catalog.work){
+  if((s.completedPastPapers||[]).some(x=>x.problemKey===rc11DailyKey_(entry.problem)))continue;
   if(entry.paused||entry.remainderPassed||entry.problem.subquestionPath.includes('*'))continue;
   const w=rc11DailyWork_(entry),rs=by.get(rc11DailyKey_(entry.problem))||[];
   if(rs.length||s.legacy?.states?.[rc11DailyKey_(entry.problem)]||s.legacy?.history?.[rc11DailyKey_(entry.problem)]){const r=rc11DailyReview_(s,entry.problem,rs,today);if(r.status==='HOLD'){held.push({problem:entry.problem,reasons:r.reasons});continue;}if(r.status==='NEW'){if(s.catalog.newMode!=='enabled'||entry.newPaused)continue;}else{w.state={status:'ready',graduated:r.graduated,attemptCount:r.attemptCount||rs.length||1,obligations:r.obligations};w.minutes=entry.reviewMinutes||w.minutes;}}
@@ -6837,12 +6945,13 @@ function rc11DailyPlan_(s,today,instant){
  for(const routine of s.catalog.routines||[]){if(routine.paused)continue;const dates=new Set(days.map(d=>d.date));for(const o of s.plan?.occurrences||[]){if(o.problem.editionId==='routine'&&o.problem.problemNumber.startsWith(routine.id+'@'))dates.add(o.problem.problemNumber.slice((routine.id+'@').length));}for(const date of [...dates].sort()){const day={date};
   const wd=new Date(day.date+'T00:00:00Z').getUTCDay();if(routine.weekdays&&!routine.weekdays.includes(wd))continue;
   if(routine.from&&day.date<routine.from||routine.through&&day.date>routine.through)continue;
+  const planningDay=days.find(d=>d.date===day.date);if(planningDay&&planningDay.totalMinutes===0)continue;
   const id=routine.id+'@'+day.date;if(s.completedRoutines.includes(id))continue;
   work.push(rc11DailyWork_({problem:{materialId:routine.title,editionId:'routine',problemKind:'routine',problemNumber:id,subquestionPath:[]},minutes:routine.minutes,priority:routine.priority||2,earliestDate:day.date,firstAttemptBy:day.date}));
  }}
  if(work.length>5000)throw Error('TOO_MANY_ACTIVE_WORK_ITEMS');
  const previous=s.plan?.occurrences?.filter(o=>o.status==='SCHEDULED').map(o=>({occurrenceId:o.occurrenceId,scheduledDate:o.scheduledDate}))||[];
- const plan=RC11Next.simulateDailyPlan({asOf:instant,baseGeneration:s.revision,policyRevision:'v0.3',newMode:'enabled',days,work,previous,grouping:{targetMinutes:60,implementationMaxMinutes:80}});
+ const plan=RC11Next.simulateDailyPlan({asOf:instant,baseGeneration:s.revision,policyRevision:'v0.3',newMode:'enabled',days,work,previous,...(s.catalog.planningPolicy||{}),grouping:{targetMinutes:60,implementationMaxMinutes:80}});
  if(plan.status!=='ready')throw Error('DAILY_PLAN_'+plan.reasons.join(','));
  // Domain revision is a full canonical value; store its digest, not a duplicate plan.
  plan.revisionId=rc11DailyHash_(plan.revisionId);plan.studyDay=today;plan.held=held;plan.spentMinutes=spent;plan.materialDisplay=s.catalog.materialDisplay||{};
@@ -6881,6 +6990,7 @@ function rc11DailyApply_(state,request,today){
    s.corrections.push(correction);
   }else if(op.type==='SET_CAPACITY'){
    const day=op.day;if(!day?.date)throw Error('DAY_REQUIRED');const n=s.catalog.days.findIndex(x=>x.date===day.date);if(n<0)s.catalog.days.push(day);else s.catalog.days[n]=day;
+  }else if(op.type==='SET_PLANNING_POLICY'){s.catalog.planningPolicy=op.policy;
   }else if(op.type==='SET_WEEKLY'){s.catalog.weekly=op.weekly;
   }else if(op.type==='SET_NEW_MODE'){if(!['enabled','disabled'].includes(op.mode))throw Error('INVALID_NEW_MODE');s.catalog.newMode=op.mode;
   }else if(op.type==='PAUSE_WORK'||op.type==='RESUME_WORK'){
@@ -6984,17 +7094,32 @@ function rc11DailySummary_(s,today){
 function rc11DailyRun(){return rc11DailyLock_(function(){
  const opened=rc11DailyOpen_(),loaded=rc11DailyRead_(opened.store),s=loaded.state,today=rc11NextCurrentStudyDay_();let head=loaded.head;
  // Finish a persisted provider request before changing its plan context.
- if(s.pending){const sync=rc11DailySync_(opened,s,head);head=sync.head;if(s.pending)return {...sync,summary:rc11DailySummary_(s,today)};}
+ if(s.pending){
+  if(s.unified&&rc11UnifiedSyncBlockers_(s).length)
+   return {status:'REMOTE_COMPLETION_UNRESOLVED',processed:0,unresolved:rc11UnifiedSyncBlockers_(s).length,summary:rc11DailySummary_(s,today)};
+  const sync=rc11DailySync_(opened,s,head);head=sync.head;if(s.pending)return {...sync,summary:rc11DailySummary_(s,today)};
+ }
  if(rc11DailyRepairHistoryNeeded_(s)){
   const repaired=rc11DailyRepairHistoryState_(s,rc11DailyReadLegacy_().tables,today);
   head=rc11DailySave_(opened.store,s,head,{type:'HISTORY_RECONCILIATION',...repaired});
  }
+ if(s.unified&&rc11UnifiedRefresh_(opened,s))head=rc11DailySave_(opened.store,s,head,{type:'CATALOG_REFRESH'});
  if(rc11DailyInbox_(opened,s))head=rc11DailySave_(opened.store,s,head,{type:'INBOX'});
   rc11DailyAck_(opened,s);
+ const pastPaperCompletion=rc11DailyCollectPastPaperCompletions_(opened,s);
+ if(pastPaperCompletion.count)
+  head=rc11DailySave_(opened.store,s,head,{type:'PAST_PAPER_TODOIST_COMPLETION',count:pastPaperCompletion.count});
+ if(!['OK','NO_PENDING_PAST_PAPERS'].includes(pastPaperCompletion.status))
+  return {status:'PAST_PAPER_COMPLETION_CHECK_FAILED',reason:pastPaperCompletion.status,processed:0,summary:rc11DailySummary_(s,today)};
  if(s.dirty||s.plan?.studyDay!==today){s.plan=rc11DailyPlan_(s,today,rc11NextTokyoInstant_());s.dirty=false;head=rc11DailySave_(opened.store,s,head,{type:'REPLAN',today});}
+ if(s.unified&&rc11UnifiedReconcileRemote_(opened,s))head=rc11DailySave_(opened.store,s,head,{type:'REMOTE_PROGRESS'});
+ // A completed task and a deleted task both disappear from the active API.
+ // Do not create/update/close anything until provenance is reconciled.
+ if(s.unified&&rc11UnifiedSyncBlockers_(s).length)
+  return {status:'REMOTE_COMPLETION_UNRESOLVED',processed:0,unresolved:rc11UnifiedSyncBlockers_(s).length,summary:rc11DailySummary_(s,today)};
  const sync=rc11DailySync_(opened,s,head);head=sync.head;
  if(rc11NextClockMinutes_()>=2330&&s.lastClose?.studyDay!==today){s.lastClose=rc11DailySummary_(s,today);head=rc11DailySave_(opened.store,s,head,{type:'DAY_CLOSE',today});}
- return {status:sync.status,processed:sync.processed,reason:sync.reason||null,summary:rc11DailySummary_(s,today)};
+ return {status:sync.status,processed:sync.processed,reason:sync.reason||null,pastPaperCompletion,summary:rc11DailySummary_(s,today)};
 });}
 function rc11DailyLogSummary_(r){
  const summary=r.summary||{};
@@ -7018,7 +7143,7 @@ function rc11DailyInbox_(opened,s){
   if(processed>=50)break;
   const id=String(row[0]||''),status=String(row[3]||'');
   if(!id||status==='APPLIED'||status==='REJECTED')continue;
-  if(status&&status!=='PENDING')continue;
+  if(status&&!['PENDING','READY'].includes(status))continue;
   if(s.inbox[id]&&['APPLIED','REJECTED'].includes(s.inbox[id].status))continue;
   const candidate=JSON.parse(JSON.stringify(s));
   try {
@@ -7056,6 +7181,7 @@ function rc11DailySetup(){return rc11DailyLock_(function(){
 });}
 
 
+
 /**
  * Step 4 Todoist transport for the daily Sheets-backed GAS runtime.
  * Sheets owns the learning state. Todoist is a display of scheduled groups.
@@ -7077,8 +7203,10 @@ function rc11DailyTodoistPayload_(config,op){
    throw Error('TODOIST_TASK_INVALID');
  if(t.due!==null&&t.due!==undefined&&!/^\d{4}-\d{2}-\d{2}$/.test(String(t.due)))
    throw Error('TODOIST_DUE_INVALID');
+ const isPastPaper=String(t.details||'').startsWith('NAGOYA_PASTPAPER ');
  const description='RC11_DAILY:'+op.bindingId+'\n目安：'+(t.minutes||0)+'分\n'+(t.details||'')+
-   '\n○△×の報告が学習履歴の正本です。Todoistの完了操作だけでは卒業しません。';
+   (isPastPaper?'\n過去問：Todoistで完了すると実施済みとして学習履歴に反映。得点・復習は別途報告。':
+    '\n○△×の報告が学習履歴の正本です。Todoistの完了操作だけでは卒業しません。');
  const args={
   ...(op.kind==='CREATE'?{project_id:config.todoistProject}:{id:op.remoteId}),
   content:t.content,description,priority:t.priority,
@@ -7152,6 +7280,460 @@ function rc11DailyTodoistConnectionCheck(){
  console.log('RC11_TODOIST_CHECK '+JSON.stringify(result));
  return result;
 }
+
+/** One catalog, plan and durable outbox. The 1130 table is an import source only.
+ * IDs are matched by TodoistID, never by the mutable spreadsheet row number.
+ * This module does not run a second scheduler or a second Todoist transport. */
+function rc11UnifiedSource_(ss) {
+ const tables={};
+ for(const name of ['RC11V2_Goals','RC11V2_Days','RC11V2_Config','RC11_1130課題']) tables[name]=rc11DailyTable_(ss,name);
+ return tables;
+}
+/** Resolve one-time 1130 IDs from the explicit Fresh source while retaining
+ * canonical goals/history from the target. A missing/ambiguous source blocks
+ * cutover before any sheet, script-property or provider write. */
+function rc11UnifiedCutoverTables_(target,legacy1130SheetId){
+ if(typeof legacy1130SheetId!=='string'||!legacy1130SheetId)throw Error('LEGACY_1130_SOURCE_SHEET_ID_REQUIRED');
+ const tables=rc11UnifiedSource_(target);
+ const legacy=SpreadsheetApp.openById(legacy1130SheetId);
+ if(!legacy.getSheetByName('RC11_1130課題'))throw Error('LEGACY_1130_SOURCE_TABLE_MISSING');
+ const rows=rc11DailyTable_(legacy,'RC11_1130課題');
+ if(!rows.length)throw Error('LEGACY_1130_SOURCE_ROWS_MISSING');
+ const ids=rows.map(row=>String(row.TodoistID||'').trim());
+ if(ids.some(id=>!id))throw Error('LEGACY_1130_ROW_WITHOUT_TODOIST_ID');
+ if(new Set(ids).size!==ids.length)throw Error('DUPLICATE_LEGACY_1130_TODOIST_ID');
+ tables['RC11_1130課題']=rows;
+ for(const name of ['RC11V2_State','RC11V2_Results','EventLog','Reports','RC11V21_EventMeta'])
+  tables[name]=rc11DailyTable_(target,name);
+ return tables;
+}
+function rc11UnifiedCatalog_(s,tables,today) {
+ const goals=tables.RC11V2_Goals||[],days=tables.RC11V2_Days||[];
+ const activeKeys=new Set(goals.filter(g=>g.Status==='ACTIVE').flatMap(g=>rc11DailyExpand_(g.Scope).map(n=>rc11DailyKey_(rc11DailyLegacyProblem_(g.MaterialID+':'+n)))));
+ for(const g of goals.filter(g=>g.Status!=='ACTIVE'))for(const n of rc11DailyExpand_(g.Scope)){const key=rc11DailyKey_(rc11DailyLegacyProblem_(g.MaterialID+':'+n));if(!activeKeys.has(key)){const w=s.catalog.work.find(w=>rc11DailyKey_(w.problem)===key);if(w)w.newPaused=true;}}
+ const find=p=>s.catalog.work.find(w=>rc11DailyKey_(w.problem)===rc11DailyKey_(p));
+ for(const g of goals.filter(g=>g.Status==='ACTIVE'))for(const n of rc11DailyExpand_(g.Scope)){
+  const p=rc11DailyLegacyProblem_(g.MaterialID+':'+n);let w=find(p);
+  if(!w){w={...rc11DailyWork_({problem:p})};s.catalog.work.push(w);}
+  // Grades, legacy evidence, corrections and remainderPassed are never replaced.
+  Object.assign(w,{paused:false,newPaused:false,minutes:Number(g.MinPerItem)||w.minutes,
+   subject:g.Subject,category:'exercise',rank:Number(g.Priority)||4,
+   priority:Math.max(1,Math.min(4,Math.ceil(Number(g.Priority||4)/3))),
+   earliestDate:g.StartDate||today,firstAttemptBy:g.TargetDate?rc11DailyPlus_(g.TargetDate,-3):null,
+   masteryBy:g.TargetDate||null});
+  if((g.MaterialID==='PHYS_RYOMON'&&Number(n)>=100&&Number(n)<=142)||(g.MaterialID==='CHEM_JUMON'&&Number(n)>=187&&Number(n)<=225)){w.focusFrom='2026-11-12';w.focusThrough='2026-11-14';}
+ }
+ for(const row of days){
+  const date=row.Date;if(!/^\d{4}-\d{2}-\d{2}$/.test(date))continue;
+  const wd=new Date(date+'T00:00:00Z').getUTCDay(),off=wd===0||wd===6||row.SchoolHoliday==='TRUE';
+  const old=s.catalog.days.find(d=>d.date===date);
+  const blocked=row.Blocked==='TRUE'||old?.totalMinutes===0;
+  const d={date,classification:off?'rest':'weekday',totalMinutes:blocked?0:row.TotalMinutes!==''?Number(row.TotalMinutes):off?600:300,
+   fixed:blocked?[]:(old?.fixed||[]).filter(f=>f.id!=='cram'),capacityExceptionRef:'unified-owner-calendar',calendarEvidenceRef:'RC11V2_Days'};
+  if(old)Object.assign(old,d);else s.catalog.days.push(d);
+ }
+ s.catalog.newMode='enabled';s.catalog.horizon=Math.max(s.catalog.horizon||35,60);
+ s.catalog.weekly=Array.from({length:7},(_,i)=>({totalMinutes:i===0||i===6?600:300,fixed:[]}));
+ for(const d of s.catalog.days)if(d.date>='2026-11-06')d.fixed=d.fixed.filter(f=>f.id!=='cram');
+ const exam=s.catalog.days.find(d=>d.date==='2026-11-15');
+ if(exam){exam.totalMinutes=0;exam.fixed=[];}else s.catalog.days.push({date:'2026-11-15',classification:'rest',totalMinutes:0,fixed:[],capacityExceptionRef:'owner-mock',calendarEvidenceRef:'owner-20261111'});
+ s.catalog.planningPolicy={pastPapersPerWeek:6,focus:[]};
+ s.dirty=true;
+}
+function rc11UnifiedTaskProblems_(row,s) {
+ // 1130 past-paper rows have no material/problem cells. Match the verified
+ // existing paper identity by year and subject instead of inventing a routine.
+ if(String(row['区分']||'')==='PAST'){
+  const label=String(row['課題名']||'').replace(/\s+/g,'');
+  const match=/(20\d{2})年度(?:名大)?(数学|英語|理科|物理|化学)/.exec(label);
+  if(!match)throw Error('PAST_PAPER_LABEL_AMBIGUOUS:'+String(row.TodoistID||''));
+  const paper=match[1]+'年度 '+match[2];
+  const matches=s.catalog.work.filter(w=>w.problem?.materialId==='NAGOYA_PASTPAPER'&&w.problem.problemNumber===paper);
+  if(matches.length!==1)throw Error('PAST_PAPER_CATALOG_MISSING_OR_DUPLICATE:'+paper);
+  return [matches[0].problem];
+ }
+ // Existing daily bindings already carry exact members. Only numbered 1130
+ // exercises need decoding; ambiguous rows abort import instead of being guessed.
+ let material=String(row['教材']||''),numbers=String(row['問題番号']||'');
+ if(!numbers){const m=/^(\S+)\s+(.+)$/.exec(material);if(m){material=m[1];numbers=m[2];}}
+ if(!material||!numbers)return []; // Preserve an unnumbered study session as a routine.
+ return rc11DailyExpand_(numbers).map(n=>rc11DailyLegacyProblem_(material+':'+n));
+}
+/** Completion evidence is admitted only for a one-paper binding already owned by
+ * the old daily runtime. A system-generated item_close must not be mistaken for
+ * the owner having studied a paper. Source close ACK timestamps disambiguate. */
+function rc11UnifiedArchiveCompletedPapers_(s,items,projectId,sourceCloseAt){
+ if(!Array.isArray(items))throw Error('COMPLETED_INVENTORY_INVALID');
+ const known=new Set((s.completedPastPapers||[]).map(x=>x.problemKey)),entries=[];
+ for(const item of items){
+  if(!item||!item.id||!item.completed_at)continue;
+  if(item.project_id&&String(item.project_id)!==String(projectId))continue;
+  const candidates=(s.bindings||[]).filter(b=>String(b.remoteId)===String(item.id)&&b.members?.length===1);
+  if(candidates.length>1)throw Error('DUPLICATE_COMPLETION_BINDING:'+item.id);
+  const b=candidates[0];if(!b)continue;
+  const w=s.catalog.work.find(w=>w.problem?.materialId==='NAGOYA_PASTPAPER'&&
+   b.members[0]===JSON.stringify(['NEW',rc11DailyKey_(w.problem),'v0.3']));
+  if(!w)continue;
+  const key=rc11DailyKey_(w.problem);
+  if(known.has(key))continue;
+  const completeMs=Date.parse(String(item.completed_at));
+  if(!Number.isFinite(completeMs))throw Error('COMPLETION_DATE_INVALID:'+item.id);
+  if(b.closed){
+   // Closure by the RC11 sync transport creates a Todoist completion too.
+   // A user completion can be trusted only when it predates that CLOSE ACK.
+   const systemClose=sourceCloseAt?.[String(item.id)];
+   if(!systemClose||!(completeMs+1000<Date.parse(systemClose))){
+    entries.push({id:String(item.id),problemKey:key,reason:'COMPLETION_OR_SYSTEM_CLOSE_UNRESOLVED'});
+    continue;
+   }
+  }
+  s.completedPastPapers=s.completedPastPapers||[];
+  s.completedPastPapers.push({problemKey:key,problem:w.problem,todoistId:String(item.id),
+   completedAt:String(item.completed_at),source:'TODOIST_VERIFIED_COMPLETION'});
+  known.add(key);b.closed=true;s.dirty=true;
+ }
+ return entries;
+}
+/** Exact script-written CLOSE commands confirmed by their ACK in the old ledger. */
+function rc11UnifiedSourceClosures_(ss){
+ const sh=ss.getSheetByName('Next_ActionLog');if(!sh)return {};
+ const last=sh.getLastRow(),pending=new Map(),closed={};
+ if(last<2)return closed;
+ const rows=sh.getRange(2,4,last-1,2).getValues();
+ for(const row of rows){
+  let action;try{action=JSON.parse(String(row[0]||''));}catch{continue;}
+  if(action.type==='SYNC_INTENT'&&action.op?.kind==='CLOSE'&&action.op.remoteId&&action.op.uuid)
+   pending.set(String(action.op.uuid),String(action.op.remoteId));
+  if(action.type==='SYNC_ACK'&&pending.has(String(action.uuid))){
+   const id=pending.get(String(action.uuid));pending.delete(String(action.uuid));
+   if(String(action.remoteId)!==id)continue;
+   const stamp=String(row[1]||'');
+   if(Number.isFinite(Date.parse(stamp)))closed[id]=stamp;
+  }
+ }
+ return closed;
+}
+/** All pages are required; an incomplete archive must block migration. */
+function rc11UnifiedCompletedInventory_(config){
+ if(!config.todoistToken||!config.todoistProject)throw Error('COMPLETION_CONFIG_MISSING');
+ const now=Date.now(),since=new Date(now-89*86400000).toISOString(),until=new Date(now+86400000).toISOString();
+ const items=[],seen=new Set();let cursor=null,pages=0;
+ do {
+  const url='https://api.todoist.com/api/v1/tasks/completed/by_completion_date?since='+
+   encodeURIComponent(since)+'&until='+encodeURIComponent(until)+'&project_id='+
+   encodeURIComponent(config.todoistProject)+'&limit=50'+(cursor?'&cursor='+encodeURIComponent(cursor):'');
+  const response=UrlFetchApp.fetch(url,{method:'get',
+   headers:{Authorization:'Bearer '+config.todoistToken,Accept:'application/json'},muteHttpExceptions:true});
+  if(response.getResponseCode()!==200)throw Error('COMPLETED_INVENTORY_HTTP_'+response.getResponseCode());
+  const data=JSON.parse(response.getContentText());
+  if(!Array.isArray(data.items))throw Error('COMPLETED_INVENTORY_INVALID');
+  items.push(...data.items);cursor=typeof data.next_cursor==='string'&&data.next_cursor?data.next_cursor:null;
+  if(cursor&&(seen.has(cursor)||++pages>=50))throw Error('COMPLETED_INVENTORY_INCOMPLETE');
+  if(cursor)seen.add(cursor);
+ }while(cursor);
+ return items;
+}
+
+/** Retire only obsolete owned displays with conclusive evidence.
+ * Textbook Todoist checks are NOT grades; the still-unreported work is replanned.
+ * Unknown remote disappearances halt the migration instead of silently erasing work. */
+function rc11UnifiedRetireInactiveOwned_(s,remote,completed){
+ const active=new Set(remote.map(t=>String(t.id))),done=new Set(completed.map(t=>String(t.id)));
+ let retired=0;
+ for(const binding of (s.bindings||[]).filter(b=>!b.closed&&b.remoteId&&!active.has(String(b.remoteId)))){
+  const isPaper=JSON.stringify(binding.members||[]).includes('NAGOYA_PASTPAPER')||
+   String(binding.task?.details||'').startsWith('NAGOYA_PASTPAPER ');
+  if(isPaper){
+   const paper=s.catalog.work.find(w=>w.problem?.materialId==='NAGOYA_PASTPAPER'&&
+    (binding.members||[]).includes(JSON.stringify(['NEW',rc11DailyKey_(w.problem),'v0.3'])));
+   if(!paper)throw Error('UNKNOWN_MISSING_PAST_PAPER:'+binding.remoteId);
+   const complete=(s.completedPastPapers||[]).some(x=>x.problemKey===rc11DailyKey_(paper.problem));
+   if(!complete&&!paper.paused)throw Error('MISSING_PAST_PAPER_UNVERIFIED:'+binding.remoteId);
+   binding.closed=true;binding.retiredReason=complete?'VERIFIED_PAPER_COMPLETION':'OWNER_EXCLUDED_PAPER';
+  }else{
+   if(!done.has(String(binding.remoteId)))throw Error('MISSING_TEXTBOOK_UNVERIFIED:'+binding.remoteId);
+   binding.closed=true;binding.retiredReason='TODOIST_CHECKED_EXPLICIT_GRADE_REQUIRED';
+  }
+  retired++;
+ }
+ return retired;
+}
+
+function rc11UnifiedRemoteTask_(t) {
+ return {content:t.content,due:t.due?.date||null,priority:t.priority,minutes:Number(/目安[：:]\s*(\d+)分/.exec(t.description||'')?.[1]||0),details:''};
+}
+function rc11UnifiedMerge_(original,tables,remote,today,instant,completionEvidence) {
+ const s=JSON.parse(JSON.stringify(original));if(s.pending)throw Error('FINISH_PENDING_SYNC_BEFORE_UNIFICATION');
+ rc11UnifiedHistory_(s,tables,today);
+ rc11UnifiedCatalog_(s,tables,today);
+ const unresolvedCompletions=completionEvidence?rc11UnifiedArchiveCompletedPapers_(s,completionEvidence.items,completionEvidence.projectId,completionEvidence.sourceCloseAt):[];
+ if(unresolvedCompletions.length)throw Error('COMPLETION_OR_SYSTEM_CLOSE_UNRESOLVED:'+JSON.stringify(unresolvedCompletions));
+ const rows=tables['RC11_1130課題']||[],inventory=new Map(remote.map(t=>[String(t.id),t]));
+ // Keep completed/paused exams as-is. Dates formerly used as ad-hoc placement
+ // locks become preferences; the completion target remains 31 December.
+ for(const w of s.catalog.work.filter(w=>w.problem.materialId==='NAGOYA_PASTPAPER')){
+  // The owner explicitly removed 2026 papers from remaining work. Retain all evidence.
+  if(/^2026年度(?:\s|$)/.test(w.problem.problemNumber))w.paused=true;
+  w.category='pastpaper';w.subject=w.problem.problemNumber.replace(/^.*年度\s*/, '');
+  w.preferredDate=w.earliestDate;w.earliestDate=today;w.firstAttemptBy='2026-12-31';
+  if(w.subject==='英語')w.minutes=130;if(w.subject==='数学'||w.subject==='理科')w.minutes=180;
+ }
+ if(completionEvidence)rc11UnifiedRetireInactiveOwned_(s,remote,completionEvidence.items);
+ const active=s.bindings.filter(b=>!b.closed),byRemote=new Map(active.map(b=>[b.remoteId,b]));
+ if(byRemote.size!==active.length)throw Error('DUPLICATE_ACTIVE_REMOTE_BINDING');
+ for(const row of rows){
+  const id=String(row.TodoistID||''),remoteTask=inventory.get(id),existing=byRemote.get(id);
+  if(existing){
+   const preferred=row['日付'];
+   for(const member of existing.members){const old=original.plan?.occurrences.find(o=>o.occurrenceId===member),w=old&&s.catalog.work.find(w=>rc11DailyKey_(w.problem)===rc11DailyKey_(old.problem));if(w&&preferred)w.preferredDate=preferred;}
+   continue;
+  }
+  if(!id)continue;
+  // A missing active remote can be a completion/deletion: retain the source row
+  // as evidence; never manufacture a ○ or a new binding from absence.
+  if(!remoteTask)continue;
+  const problems=rc11UnifiedTaskProblems_(row,s);
+  const description=String(remoteTask.description||''),sameTitle=String(remoteTask.content||'')===String(row['課題名']||'');
+  const standard=/^(?:RC11_PLAN1130_ROW:\d+(?:\n|$)|RC11 模試対策 )/.test(description);
+  // User-approved manual 1130 replacements retained an exact Sheet ID but have
+  // a different description marker. Require both exact provider title and typed
+  // provenance in addition to the source ID; never adopt arbitrary Todoist tasks.
+  const paper=String(row['区分']||'')==='PAST'&&problems.length===1&&
+   description.startsWith('RC11_1130課題と連動した出題年度の変更登録。')&&
+   description.includes('NAGOYA_PASTPAPER '+problems[0].problemNumber);
+  const reserve=String(row['区分']||'')==='OTHER'&&
+   /^共通テスト演習｜予備枠/.test(String(row['課題名']||''))&&
+   /^仮確保。共テ演習専用\d+分。/.test(description);
+  if(!(standard||(sameTitle&&(paper||reserve))))throw Error('UNOWNED_1130_REMOTE:'+id);
+  if(!problems.length){const date=row['日付'],minutes=Number(row['所要分']);if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isInteger(minutes)||minutes<1)throw Error('INVALID_1130_SESSION:'+id);
+   const rid='imported-session:'+id;if(!s.catalog.routines.some(r=>r.id===rid))s.catalog.routines.push({id:rid,title:row['課題名'],from:date,through:date,minutes,priority:remoteTask.priority});
+  }
+  for(const p of problems)if(!s.catalog.work.some(w=>rc11DailyKey_(w.problem)===rc11DailyKey_(p)))throw Error('1130_SCOPE_NOT_REGISTERED:'+rc11DailyKey_(p));
+ }
+ s.plan=rc11DailyPlan_(s,today,instant);s.dirty=false;
+ for(const row of rows){
+  const id=String(row.TodoistID||''),t=inventory.get(id);if(!t||byRemote.has(id))continue;
+  const problems=rc11UnifiedTaskProblems_(row,s),stage=/R[123]/.exec(String(row['復習段階']||row['種別']||''))?.[0]||'NEW';
+  const members=problems.length?problems.map(p=>s.plan.occurrences.find(o=>rc11DailyKey_(o.problem)===rc11DailyKey_(p)&&o.stage===stage)?.occurrenceId||'retired-conditional:'+id+':'+rc11DailyKey_(p)):[s.plan.occurrences.find(o=>o.problem.editionId==='routine'&&o.problem.problemNumber==='imported-session:'+id+'@'+row['日付'])?.occurrenceId||'retired-session:'+id];
+  const b={id:rc11DailyHash_(['adopt-1130',id]),remoteId:id,members,task:rc11UnifiedRemoteTask_(t),closed:false,sourceMarker:'RC11_PLAN1130_ROW'};
+  s.bindings.push(b);byRemote.set(id,b);
+ }
+ // Reconcile cached daily payloads with the actual provider values. This makes
+ // direct date/title edits converge once instead of being invisible forever.
+ for(const b of s.bindings.filter(b=>!b.closed)){
+  const t=inventory.get(b.remoteId);if(!t)continue;
+  if(t.project_id&&String(t.project_id)!==String(remote[0]?.project_id))throw Error('REMOTE_PROJECT_MISMATCH');
+  const expected=rc11DailyTodoistPayload_({todoistProject:String(t.project_id||'project-id')},{kind:'UPDATE',uuid:'00000000-0000-0000-0000-000000000000',bindingId:b.id,remoteId:b.remoteId,task:b.task}).args;
+  if(t.content!==expected.content||t.description!==expected.description||t.due?.date!==expected.due?.date||t.priority!==expected.priority)b.task=rc11UnifiedRemoteTask_(t);
+ }
+ s.unified={version:1,sourceDigest:rc11DailyHash_(tables),importedAt:today,legacyRows:JSON.parse(JSON.stringify(rows))};
+ return s;
+}
+function rc11UnifiedInventory_(config){
+ const tasks=[],seen=new Set();let cursor=null;
+ do{const url='https://api.todoist.com/api/v1/tasks?project_id='+encodeURIComponent(config.todoistProject)+'&limit=200'+(cursor?'&cursor='+encodeURIComponent(cursor):'');
+  const r=UrlFetchApp.fetch(url,{headers:{Authorization:'Bearer '+config.todoistToken},muteHttpExceptions:true});
+  if(r.getResponseCode()!==200)throw Error('TODOIST_INVENTORY_HTTP_'+r.getResponseCode());
+  const data=JSON.parse(r.getContentText());if(!Array.isArray(data.results))throw Error('TODOIST_INVENTORY_INVALID');tasks.push(...data.results);
+  cursor=data.next_cursor;if(cursor&&seen.has(cursor))throw Error('TODOIST_CURSOR_REPEAT');seen.add(cursor);
+ }while(cursor);return tasks;
+}
+/** Strict read-only preflight. No source workbook, Todoist or ScriptProperty writes.
+ * Exposes only aggregate counts; the owner can inspect this before cutover. */
+function rc11DailyUnifyPreview(targetSheetId,legacy1130SheetId){
+ const opened=rc11DailyOpen_(),loaded=rc11DailyRead_(opened.store);
+ if(!targetSheetId)throw Error('TARGET_SHEET_REQUIRED');
+ const target=SpreadsheetApp.openById(targetSheetId);
+ let tables=null,sourceError=null;
+ try{tables=rc11UnifiedCutoverTables_(target,legacy1130SheetId);}catch(e){sourceError=String(e.message||e);}
+ const handlers=ScriptApp.getProjectTriggers().map(t=>t.getHandlerFunction());
+ const otherHandlers=[...new Set(handlers.filter(name=>name!=='rc11DailyClock'))].sort();
+ const inbox=rc11DailyTable_(opened.sheet,'Next_Reports');
+ const pendingInbox=inbox.filter(row=>['READY','PENDING'].includes(String(row.Status||''))).length;
+ const blockers=[];
+ if(sourceError)blockers.push(sourceError);
+ if(loaded.state.pending)blockers.push('PENDING_SYNC_INTENT');
+ if(otherHandlers.length)blockers.push('UNREVIEWED_LEGACY_TRIGGERS');
+ if(pendingInbox)blockers.push('PENDING_INBOX_REQUESTS_REQUIRE_ATOMIC_MIGRATION');
+ let result=null;
+ if(!loaded.state.pending&&tables){
+  try{
+   const remote=rc11UnifiedInventory_(opened.config);
+   const completed=rc11UnifiedCompletedInventory_(opened.config);
+   const evidence={items:completed,projectId:opened.config.todoistProject,
+    sourceCloseAt:rc11UnifiedSourceClosures_(opened.sheet)};
+   const s=rc11UnifiedMerge_(loaded.state,tables,remote,rc11NextCurrentStudyDay_(),rc11NextTokyoInstant_(),evidence);
+   const ops=rc11DailyDiff_(s),counts={CREATE:0,UPDATE:0,CLOSE:0};
+   for(const op of ops)counts[op.kind]++;
+   result={catalogWork:s.catalog.work.length,pastPapers:s.catalog.work.filter(w=>w.problem?.materialId==='NAGOYA_PASTPAPER').length,
+    completedPastPapers:(s.completedPastPapers||[]).length,
+    adoptedBindings:s.bindings.filter(b=>!b.closed).length,plannedGroups:s.plan.groups.length,
+    actions:counts,sourceRevision:loaded.state.revision};
+  }catch(e){blockers.push(String(e.message||e));}
+ }
+ return {status:blockers.length?'NO_GO':'PREVIEW_READY',targetSheetId,legacyRows:tables?.['RC11_1130課題']?.length||0,otherHandlers,
+  pendingInbox,blockers,simulation:result,externalWrites:0,providerMutations:0};
+}
+
+/** Explicit one-time migration, invoked only after installed-code/trigger review.
+ * targetSheetId is the user-selected canonical workbook. Existing source remains
+ * intact. Retry after target commit/property failure adopts the committed target. */
+function rc11DailyUnify(targetSheetId,legacy1130SheetId){return rc11DailyLock_(function(){
+ const opened=rc11DailyOpen_(),loaded=rc11DailyRead_(opened.store),props=rc11DailyProps_();
+ if(!targetSheetId)throw Error('TARGET_SHEET_REQUIRED');
+ // Never migrate while an unreviewed time-driven writer could still modify
+ // the old task table. No trigger is removed or changed by this preflight.
+ const otherHandlers=ScriptApp.getProjectTriggers().map(t=>t.getHandlerFunction())
+  .filter(name=>name!=='rc11DailyClock');
+ if(otherHandlers.length)throw Error('UNREVIEWED_LEGACY_TRIGGERS:'+JSON.stringify([...new Set(otherHandlers)].sort()));
+ const target=SpreadsheetApp.openById(targetSheetId),store=rc11SheetsDailyStore_(target),previous=rc11DailyRead_(store);
+ if(previous.state.unified?.sourceSheetId===opened.config.sheetId||previous.state.unified&&opened.config.sheetId===targetSheetId){
+  // A prior run might have committed the target before acknowledging the old inbox.
+  rc11DailyAck_(opened,previous.state);
+  props.setProperty('RC11_SHEET_ID',targetSheetId);return {status:'ALREADY_UNIFIED'};
+ }
+ if(previous.state.revision&&targetSheetId!==opened.config.sheetId)throw Error('TARGET_ALREADY_HAS_DIFFERENT_RUNTIME');
+ const today=rc11NextCurrentStudyDay_(),tables=rc11UnifiedCutoverTables_(target,legacy1130SheetId);
+ // Apply pending inbox requests in memory first. A failed preflight or merge must
+ // leave the old event journal and acknowledgement cells unchanged.
+ const candidate=JSON.parse(JSON.stringify(loaded.state));
+ const inboxChanged=rc11DailyInbox_(opened,candidate);
+ const evidence={items:rc11UnifiedCompletedInventory_(opened.config),projectId:opened.config.todoistProject,sourceCloseAt:rc11UnifiedSourceClosures_(opened.sheet)};
+ const s=rc11UnifiedMerge_(candidate,tables,rc11UnifiedInventory_(opened.config),today,rc11NextTokyoInstant_(),evidence);
+ s.unified.sourceSheetId=opened.config.sheetId;s.unified.sourceRevision=loaded.state.revision;
+ s.unified.legacy1130SheetId=legacy1130SheetId;
+ s.revision=previous.state.revision;
+ rc11DailySave_(store,s,previous.head,{type:'UNIFY_MANAGEMENT',sourceSheetId:opened.config.sheetId,sourceRevision:loaded.state.revision});
+ const readback=rc11DailyRead_(store).state;if(readback.unified?.sourceRevision!==loaded.state.revision)throw Error('UNIFICATION_READBACK');
+ // The target now durably contains applied request IDs. Acknowledge the old
+ // inbox only after that durable readback, then atomically change the pointer.
+ if(inboxChanged)rc11DailyAck_(opened,candidate);
+ props.setProperty('RC11_SHEET_ID',targetSheetId);
+ return {status:'UNIFIED_SYNC_PENDING',work:s.catalog.work.length,bindings:s.bindings.filter(b=>!b.closed).length,actions:rc11DailyDiff_(s).length};
+});}
+/** Goals/calendar remain readable inputs; 1130 rows are never re-imported. */
+function rc11UnifiedRefresh_(opened,s){
+ if(!s.unified)return false;
+ const tables=rc11UnifiedSource_(opened.sheet);delete tables['RC11_1130課題'];
+ const digest=rc11DailyHash_(tables);if(s.unified.catalogDigest===digest)return false;
+ rc11UnifiedCatalog_(s,tables,rc11NextCurrentStudyDay_());s.unified.catalogDigest=digest;return true;
+}
+
+/** A task absent from the active inventory might be completed OR deleted.
+ * It must not be rewritten or treated as a grade without positive provider evidence. */
+function rc11UnifiedSyncBlockers_(s){
+ return (s.bindings||[]).filter(b=>!b.closed&&b.remoteStatus==='NOT_ACTIVE').map(b=>b.remoteId);
+}
+/** Observe completion without promoting it to a grade. Active tasks edited outside
+ * RC11 converge to the canonical plan. Missing/closed tasks remain awaiting report
+ * and keep their learning obligations until a grade is reported. */
+function rc11UnifiedReconcileRemote_(opened,s){
+ const tasks=rc11UnifiedInventory_(opened.config),byId=new Map(tasks.map(t=>[String(t.id),t]));let changed=false;
+ // A missing display can be intentionally completed, deleted, or superseded.
+ // Fetch positive completion evidence before retiring textbook displays.
+ const missing=(s.bindings||[]).some(b=>!b.closed&&b.remoteId&&!byId.has(String(b.remoteId)));
+ if(missing){
+  const completed=rc11UnifiedCompletedInventory_(opened.config);
+  if(rc11UnifiedRetireInactiveOwned_(s,tasks,completed))changed=true;
+ }
+ for(const b of s.bindings.filter(b=>!b.closed)){
+  const t=byId.get(b.remoteId);
+  if(!t){if(b.remoteStatus!=='NOT_ACTIVE'){b.remoteStatus='NOT_ACTIVE';changed=true;}continue;}
+  if(b.remoteStatus){delete b.remoteStatus;changed=true;}
+  const expected=rc11DailyTodoistPayload_(opened.config,{kind:'UPDATE',uuid:'00000000-0000-0000-0000-000000000000',bindingId:b.id,remoteId:b.remoteId,task:b.task}).args;
+  if(t.content!==expected.content||t.description!==expected.description||t.due?.date!==expected.due?.date||t.priority!==expected.priority){const observed=rc11UnifiedRemoteTask_(t);if(JSON.stringify(b.task)!==JSON.stringify(observed)){b.task=observed;changed=true;}}
+ }
+ return changed;
+}
+/** Preserve the latest explicit source state as a checkpoint when its report
+ * trail is not already present in the daily journal. Never backdate new grades. */
+function rc11UnifiedHistory_(s,tables,today){
+ if(!tables.RC11V2_State)return;
+ const imported=rc11DailyLegacyConvert_(tables,today);
+ s.legacy=s.legacy||{states:{},history:{}};s.legacy.states=s.legacy.states||{};s.legacy.history=s.legacy.history||{};
+ s.legacy.resolutions=s.legacy.resolutions||{};
+ for(const w of imported.catalog.work){
+  const key=rc11DailyKey_(w.problem),incoming=imported.legacy.states[key],old=s.legacy.states[key];
+  const daily=rc11DailyReports_(s).filter(r=>rc11DailyKey_(r.problem)===key);
+  // When two ledgers disagree about a grade on the same study day, a timestamp
+  // alone cannot identify the winning correction. Abort rather than graduate
+  // or reschedule from a silently chosen source.
+  const source=(tables.RC11V2_State||[]).find(row=>{
+   try{return rc11DailyKey_(rc11DailyLegacyProblem_(String(row.ProblemID||'')))===key;}catch{return false;}
+  });
+  if(source&&incoming?.lastStudyDay){
+   const sourceGrade=String(source.LastGrade||'').replace('◯','○');
+   const sameDay=daily.filter(r=>r.studyDay===incoming.lastStudyDay);
+   if(['○','△','×'].includes(sourceGrade)&&sameDay.some(r=>r.grade!==sourceGrade))
+    throw Error('SAME_DAY_SOURCE_CONFLICT:'+key);
+  }
+  const latest=[old?.lastStudyDay||'',s.legacy.history[key]?.latestStudyDay||'',s.legacy.resolutions[key]?.lastStudyDay||'',...daily.map(r=>r.studyDay)].sort().pop();
+  if(!s.catalog.work.some(x=>rc11DailyKey_(x.problem)===key))s.catalog.work.push(w);
+  if(incoming?.status==='ready'&&incoming.lastStudyDay&&incoming.lastStudyDay>latest){
+   // Keep original provenance and all earlier reports. Only a *later* checkpoint
+   // is selected for replay; the old state remains in the immutable source copy.
+   s.legacy.states[key]=incoming;
+   if(imported.legacy.history[key])s.legacy.history[key]=imported.legacy.history[key];
+   const stage=incoming.graduated?'GRADUATED':({UNDERSTANDING:'R1',RETENTION:'R2',LONG_REVIEW:'R3'}[incoming.stage]||incoming.stage);
+   if(['GRADUATED','R1','R2','R3'].includes(stage))s.legacy.resolutions[key]={id:'unified-source:'+key+':'+incoming.lastStudyDay,stage,lastStudyDay:incoming.lastStudyDay,
+    attemptCount:incoming.attemptCount||1,idealReviewDate:incoming.idealReviewDate||rc11DailyPlus_(incoming.lastStudyDay,1),secondReviewDate:rc11DailyPlus_(incoming.lastStudyDay,3),sourceIds:[incoming.sourceResultId||'RC11V2_State'],preservedBeforeReports:daily.map(r=>r.submissionId)};
+  }else if(!old&&!s.legacy.history[key]){
+   if(incoming)s.legacy.states[key]=incoming;if(imported.legacy.history[key])s.legacy.history[key]=imported.legacy.history[key];
+  }
+ }
+}
+
+function rc11DailyCollectPastPaperCompletions_(opened,s){
+ const bindings=(s.bindings||[]).filter(b=>!b.closed&&b.remoteId&&b.members?.length===1);
+ const work=s.catalog.work.filter(w=>w.problem?.materialId==='NAGOYA_PASTPAPER');
+ const tracked=new Set((s.completedPastPapers||[]).map(x=>x.problemKey));
+ const pending=[];
+ for(const b of bindings){
+  const w=work.find(w=>b.members[0]===JSON.stringify(['NEW',rc11DailyKey_(w.problem),'v0.3']));
+  if(w&&!tracked.has(rc11DailyKey_(w.problem)))pending.push({binding:b,work:w});
+ }
+ if(!pending.length)return {status:'NO_PENDING_PAST_PAPERS',count:0};
+ if(!opened.config.todoistToken||!opened.config.todoistProject)return {status:'TODOIST_NOT_CONFIGURED',count:0};
+ const now=Date.now(),since=new Date(now-89*86400000).toISOString(),until=new Date(now+86400000).toISOString();
+ const completed=new Map(),seen=new Set();
+ let cursor=null,pages=0;
+ try {
+  do {
+   const params='since='+encodeURIComponent(since)+'&until='+encodeURIComponent(until)+
+    '&project_id='+encodeURIComponent(opened.config.todoistProject)+'&limit=50'+
+    (cursor?'&cursor='+encodeURIComponent(cursor):'');
+   const response=UrlFetchApp.fetch('https://api.todoist.com/api/v1/tasks/completed/by_completion_date?'+params,{
+    method:'get',headers:{Authorization:'Bearer '+opened.config.todoistToken,Accept:'application/json'},muteHttpExceptions:true
+   });
+   if(response.getResponseCode()!==200)return {status:'COMPLETED_FETCH_HTTP_'+response.getResponseCode(),count:0};
+   const data=JSON.parse(response.getContentText());
+   if(!Array.isArray(data.items))return {status:'COMPLETED_FETCH_INVALID',count:0};
+   for(const item of data.items)if(item&&item.id&&item.completed_at)completed.set(String(item.id),item);
+   cursor=typeof data.next_cursor==='string'&&data.next_cursor?data.next_cursor:null;
+   if(cursor&&seen.has(cursor))return {status:'COMPLETED_FETCH_CURSOR_LOOP',count:0};
+   if(cursor)seen.add(cursor);
+   pages++;
+  }while(cursor&&pages<20);
+  if(cursor)return {status:'COMPLETED_FETCH_INCOMPLETE',count:0};
+ }catch(e){return {status:'COMPLETED_FETCH_ERROR',count:0};}
+ s.completedPastPapers=s.completedPastPapers||[];
+ let count=0;
+ for(const {binding,work:w} of pending){
+  const item=completed.get(String(binding.remoteId));
+  if(!item)continue;
+   // Only a positively completed item from the requested project may close a paper.
+   if(item.project_id&&String(item.project_id)!==String(opened.config.todoistProject))continue;
+  const problemKey=rc11DailyKey_(w.problem);
+  if(s.completedPastPapers.some(x=>x.problemKey===problemKey))continue;
+  s.completedPastPapers.push({problemKey,problem:w.problem,todoistId:String(binding.remoteId),
+   completedAt:String(item.completed_at),source:'TODOIST_CHECKED'});
+  binding.closed=true;
+  count++;
+ }
+ if(count)s.dirty=true;
+ return {status:'OK',count};
+}
+
 
 /**
  * Step 3: rebuild review state from migrated grading evidence.
@@ -7453,7 +8035,7 @@ function rc11DailyReview_(s,problem,reports,today){
  if(problem.subquestionPath.includes('*'))
    return {status:'SCOPE',reasons:[]};
  const resolved=s.legacy?.resolutions?.[key];
- if(resolved)return rc11DailyResolvedReview_(resolved,problem,reports,today);
+ if(resolved)return rc11DailyResolvedReview_(resolved,problem,reports.filter(r=>!(resolved.preservedBeforeReports||[]).includes(r.submissionId)),today);
  if(evidence?.issues?.length)return {status:'HOLD',reasons:evidence.issues};
  if(evidence?.forcedGraduatedAt&&
    (!evidence.latestStudyDay||evidence.latestStudyDay<=evidence.forcedGraduatedAt))
@@ -7498,6 +8080,7 @@ function rc11DailyPreviewImport(){const source=rc11DailyReadLegacy_(),s=rc11Dail
 function rc11DailyImportLegacy(){return rc11DailyLock_(function(){const {store}=rc11DailyOpen_(),loaded=rc11DailyRead_(store);if(loaded.state.revision||loaded.state.catalog.work.length)return {status:'ALREADY_INITIALIZED'};const source=rc11DailyReadLegacy_(),s=rc11DailyLegacyConvert_(source.tables,rc11NextCurrentStudyDay_());s.plan=rc11DailyPlan_(s,rc11NextCurrentStudyDay_(),rc11NextTokyoInstant_());s.dirty=false;rc11DailySave_(store,s,loaded.head,{type:'IMPORT',sourceId:source.id,sourceDigest:rc11DailyHash_(source.tables)});return {status:'IMPORTED',work:s.catalog.work.length,legacyStates:Object.keys(s.legacy.states).length,history:s.legacy.historyStats,oldTodoistIdsImported:false};});}
 
 
+
 /**
  * Presentation only: human-friendly titles following legacy RC11 style.
  * The hidden RC11_NEXT_ID description remains the durable ownership marker.
@@ -7509,9 +8092,11 @@ function rc11NextVisibleTitle_(plan,group,occurrences) {
        typeof o.problem.problemNumber!=='string'||!Array.isArray(o.problem.subquestionPath)))
     throw Error('DISPLAY_MEMBERS_INVALID');
   const material=occurrences[0].problem.materialId;
+  if(material==='NAGOYA_PASTPAPER')return occurrences.map(o=>o.problem.problemNumber.replace('年度 ', '年度 名大 ')).join('・')+(group.stage==='NEW'?'（過去問）':'（'+group.stage+'復習）');
   if(occurrences.some(o=>o.problem.materialId!==material))
     throw Error('DISPLAY_MIXED_MATERIAL');
   const presets={
+    'MATH_PLA3':{subject:'数学',name:'プラチカⅢC'},
     'MATH_PLA':{subject:'数学',name:'理系プラチカ'},
     'PHYS_RYOMON':{subject:'物理',name:'良問の風'},
     'CHEM_JUMON':{subject:'化学',name:'重要問題集'},
@@ -7534,6 +8119,7 @@ function rc11NextVisibleTitle_(plan,group,occurrences) {
   if(visible.length>500)throw Error('DISPLAY_TITLE_TOO_LONG');
   return visible;
 }
+
 
 /**
  * RC11 Next GAS V8 pure-preview entrypoints.
